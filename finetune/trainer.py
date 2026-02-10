@@ -243,7 +243,19 @@ class Trainer:
                     component.requires_grad_(True)
                 else:
                     component.requires_grad_(False)
-
+        if self.args.training_type == "frozen_backbone":
+            if self.args.tfe_mgf_enable:
+                self.components.transformer.traj_extractor.requires_grad_(True)
+                for m in self.components.transformer.fuser:
+                    m.requires_grad_(True)
+            if self.args.aux_head_enable:
+                aux_path = "./aux_head_best.pth"
+                if os.path.exists(aux_path) and hasattr(self.components.transformer, "aux_head"):
+                    sd = torch.load(str(aux_path), map_location="cpu")
+                    self.components.transformer.aux_head.load_state_dict(sd, strict=True)
+                    self.components.transformer.aux_head.requires_grad_(False)
+                    logger.info(f"[CKPT] load_aux_head done <- {str(aux_path)}", main_process_only=True)
+            self.__prepare_saving_loading_hooks_no_lora()
         if self.args.training_type == "lora" or self.args.training_type == "lora_flow":
             transformer_lora_config = LoraConfig(
                 r=self.args.rank,
@@ -794,6 +806,79 @@ class Trainer:
             if not isinstance(component, type) and hasattr(component, "to"):
                 if name in unload_list:
                     setattr(self.components, name, component.to("cpu"))
+
+    # 在 Trainer 类中新增方法（放在 __prepare_saving_loading_hooks 之后）
+
+    def __prepare_saving_loading_hooks_no_lora(self):
+        """为冻结骨干 + 只训练新模块的场景注册保存/加载钩子"""
+
+        def save_model_hook(models, weights, output_dir):
+            output_dir = Path(output_dir)
+            if self.accelerator.is_main_process:
+                for model in models:
+                    model = unwrap_model(self.accelerator, model)
+                    # 不保存整个模型，只保存新增模块
+                    if weights:
+                        weights.pop()
+
+                transformer = unwrap_model(self.accelerator, self.components.transformer)
+
+                if hasattr(transformer, "traj_extractor"):
+                    te_path = output_dir / "traj_extractor.safetensors"
+                    safe_save_file(
+                        transformer.traj_extractor.state_dict(), str(te_path)
+                    )
+
+                if hasattr(transformer, "fuser"):
+                    mgf_path = output_dir / "fuser.safetensors"
+                    safe_save_file(
+                        transformer.fuser.state_dict(), str(mgf_path)
+                    )
+
+                # if hasattr(transformer, "aux_head"):
+                #     aux_path = output_dir / "aux_head.safetensors"
+                #     safe_save_file(
+                #         transformer.aux_head.state_dict(), str(aux_path)
+                #     )
+
+                logger.info(
+                    f"[CKPT] save_model_hook (no-lora) done -> {str(output_dir)}",
+                    main_process_only=True,
+                )
+
+        def load_model_hook(models, input_dir):
+            input_dir = Path(input_dir)
+            # 弹出 models 以避免 accelerate 尝试加载整个模型
+            while len(models) > 0:
+                models.pop()
+
+            transformer = unwrap_model(self.accelerator, self.components.transformer)
+
+            te_path = input_dir / "traj_extractor.safetensors"
+            if te_path.exists() and hasattr(transformer, "traj_extractor"):
+                sd = safe_load_file(str(te_path))
+                transformer.traj_extractor.load_state_dict(sd, strict=True)
+                logger.info(f"[CKPT] loaded traj_extractor <- {te_path}")
+
+            mgf_path = input_dir / "fuser.safetensors"
+            if mgf_path.exists() and hasattr(transformer, "fuser"):
+                sd = safe_load_file(str(mgf_path))
+                transformer.fuser.load_state_dict(sd, strict=True)
+                logger.info(f"[CKPT] loaded fuser <- {mgf_path}")
+
+            aux_path = input_dir / "aux_head.safetensors"
+            if aux_path.exists() and hasattr(transformer, "aux_head"):
+                sd = safe_load_file(str(aux_path))
+                transformer.aux_head.load_state_dict(sd, strict=True)
+                logger.info(f"[CKPT] loaded aux_head <- {aux_path}")
+
+            logger.info(
+                f"[CKPT] load_model_hook (no-lora) done <- {str(input_dir)}",
+                main_process_only=True,
+            )
+
+        self.accelerator.register_save_state_pre_hook(save_model_hook)
+        self.accelerator.register_load_state_pre_hook(load_model_hook)
 
     def __prepare_saving_loading_hooks(self, transformer_lora_config):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format

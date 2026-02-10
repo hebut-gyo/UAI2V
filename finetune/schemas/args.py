@@ -12,7 +12,7 @@ class Args(BaseModel):
     model_path: Path
     model_name: str
     model_type: Literal["i2v", "t2v"]
-    training_type: Literal["lora", "sft", "lora_flow"] = "lora_flow"
+    training_type: Literal["lora", "sft", "lora_flow","frozen_backbone"] = "lora_flow"
     aux_head_enable: bool = False
     aux_head_lambda: float = 0.01
     mediators_attention_enable: bool = False
