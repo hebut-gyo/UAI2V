@@ -523,7 +523,6 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 predicted_flow = self.aux_head(output).permute(0, 2, 1, 3, 4).contiguous()# 1 2 13 60 90
                 predicted_loss = torch.norm(predicted_flow - video_flow, dim=1).mean()
                 print("predicted_loss ", predicted_loss)
-                traj_static = traj_static.squeeze(2)
                 video_flow_features = self.traj_extractor(traj_static, predicted_flow, warmup_scale)
                 print("warmup_scale", warmup_scale)
 

@@ -123,37 +123,38 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "flows": [], "trajs": []}
+        ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "flows": [], "encoded_trajs": []}
 
         for sample in samples:
             encoded_video = sample["encoded_video"]
             prompt_embedding = sample["prompt_embedding"]
             image = sample["image"]
             flow = sample["flow"]
-            traj = sample["traj"]
+            traj = sample["encoded_traj"]
             ret["encoded_videos"].append(encoded_video)
             ret["prompt_embedding"].append(prompt_embedding)
             ret["images"].append(image)
             ret["flows"].append(flow)
-            ret["trajs"].append(traj)
+            ret["encoded_trajs"].append(traj)
         ret["encoded_videos"] = torch.stack(ret["encoded_videos"])
         ret["prompt_embedding"] = torch.stack(ret["prompt_embedding"])
         ret["images"] = torch.stack(ret["images"])
         ret["flows"] = torch.stack(ret["flows"])
-        ret["trajs"] = torch.stack(ret["trajs"])
+        ret["encoded_trajs"] = torch.stack(ret["encoded_trajs"])
         return ret
 
     @override
-    def compute_loss(self, batch, scale) -> torch.Tensor:
+    def compute_loss(self, batch, scale, global_step) -> torch.Tensor:
         prompt_embedding = batch["prompt_embedding"]
         latent = batch["encoded_videos"]
         images = batch["images"]
         flows = batch["flows"]
-        trajs = batch["trajs"]
+        trajs_latents = batch["encoded_trajs"]
 
         # Shape of prompt_embedding: [B, seq_len, hidden_size]
         # Shape of latent: [B, C, F, H, W]
         # Shape of images: [B, C, H, W]
+        # Shape of traj_videos: [B, C, F, H, W]
 
         patch_size_t = self.state.transformer_config.patch_size_t
         if patch_size_t is not None:
@@ -169,10 +170,8 @@ class CogVideoXI2VLoraTrainer(Trainer):
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
         flows = flows.to(device=self.accelerator.device, dtype=latent.dtype)
-        trajs = trajs.to(device=self.accelerator.device, dtype=latent.dtype)
         # Add frame dimension to images [B,C,H,W] -> [B,C,F,H,W]
         images = images.unsqueeze(2)
-        trajs = trajs.unsqueeze(2)
         # Add noise to images
         image_noise_sigma = torch.normal(
             mean=-3.0, std=0.5, size=(1,), device=self.accelerator.device
@@ -186,10 +185,6 @@ class CogVideoXI2VLoraTrainer(Trainer):
         ).latent_dist
         image_latents = image_latent_dist.sample() * self.components.vae.config.scaling_factor
         image_latents = image_latents.to(dtype=latent.dtype)
-        if trajs is not None:
-            traj_latent_dist = self.components.vae.encode(trajs.to(dtype=self.components.vae.dtype)).latent_dist
-            trajs_latents = traj_latent_dist.sample() * self.components.vae.config.scaling_factor
-            trajs_latents = trajs_latents.to(dtype=latent.dtype)
         # Sample a random timestep for each sample
         timesteps = torch.randint(
             0,
@@ -243,6 +238,9 @@ class CogVideoXI2VLoraTrainer(Trainer):
             if self.state.transformer_config.ofs_embed_dim is None
             else latent.new_full((1,), fill_value=2.0)
         )
+
+        if self.accelerator.is_main_process and global_step % 100 == 0:  # 每100步可视化一次
+            self._visualize_traj_warp(trajs_latents, flows, global_step)
         predicted_noise = self.components.transformer(
             hidden_states=latent_img_noisy,
             encoder_hidden_states=prompt_embedding,

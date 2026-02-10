@@ -67,6 +67,7 @@ class BaseI2VDataset(Dataset):
         data_root = Path(data_root)
         self.prompts = load_prompts(data_root / caption_column)
         self.videos = load_videos(data_root / video_column)
+        self.trajs = load_videos(data_root / "trajectory_videos.txt")
         if image_column is not None:
             self.images = load_images(data_root / image_column)
         else:
@@ -114,19 +115,23 @@ class BaseI2VDataset(Dataset):
         prompt = self.prompts[index]
         video = self.videos[index]
         image = self.images[index]
+        traj = self.trajs[index]
         train_resolution_str = "x".join(str(x) for x in self.trainer.args.train_resolution)
 
         cache_dir = self.trainer.args.data_root / "cache"
         id = video.stem.split('_')[-1]
         flow_dir = self.trainer.args.data_root / "flows" / f"flow_{id}.npz"
-        traj_dir = self.trainer.args.data_root / "trajectories" / f"traj_{id}.jpg"
 
         video_latent_dir = (
             cache_dir / "video_latent" / self.trainer.args.model_name / train_resolution_str
         )
+        traj_latent_dir = (
+            cache_dir / "traj_latent" / self.trainer.args.model_name / train_resolution_str
+        )
 
         prompt_embeddings_dir = cache_dir / "prompt_embeddings"
         video_latent_dir.mkdir(parents=True, exist_ok=True)
+        traj_latent_dir.mkdir(parents=True, exist_ok=True)
 
         prompt_embeddings_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,6 +139,7 @@ class BaseI2VDataset(Dataset):
         prompt_embedding_path = prompt_embeddings_dir / (prompt_hash + ".safetensors")
 
         encoded_video_path = video_latent_dir / f"clip_{id}.safetensors"
+        encoded_traj_path = traj_latent_dir / f"traj_{id}.safetensors"
 
         if prompt_embedding_path.exists():
             prompt_embedding = load_file(prompt_embedding_path)["prompt_embedding"]
@@ -191,19 +197,33 @@ class BaseI2VDataset(Dataset):
             flow = None
         # 若开启tfe
         if self.trainer.args.tfe_mgf_enable:
-            traj_pil = Image.open(traj_dir).convert("RGB")  # 单通道
-            traj_img = TF.to_tensor(traj_pil)
-            traj_img = traj_img * 2.0 - 1.0
-            traj_img = traj_img.to("cpu")
-            traj = traj_img
+            if encoded_traj_path.exists():
+                encoded_traj = load_file(encoded_traj_path)["encoded_traj"]
+                logger.debug(f"Loaded encoded traj from {encoded_traj_path}", main_process_only=False)
+            else:
+                traj_frames, _ = self.preprocess(traj, None)
+                traj_frames = traj_frames.to(self.device)
+                # Current shape of frames: [F, C, H, W]
+                traj_frames = self.video_transform(traj_frames)
+
+                # Convert to [B, C, F, H, W]
+                traj_frames = traj_frames.unsqueeze(0)
+                traj_frames = traj_frames.permute(0, 2, 1, 3, 4).contiguous()
+                encoded_traj = self.encode_video(traj_frames)
+
+                # [1, C, F, H, W] -> [C, F, H, W]
+                encoded_traj = encoded_traj[0]
+                encoded_traj = encoded_traj.to("cpu")
+                save_file({"encoded_traj": encoded_traj}, encoded_traj_path)
+                logger.info(f"Saved encoded traj to {encoded_traj_path}", main_process_only=False)
         else:
-            traj = None
+            encoded_traj = None
         return {
             "image": image, # C H W (3 480 720)
             "prompt_embedding": prompt_embedding,# N D (226 4096)
             "encoded_video": encoded_video,# T C H W (16 13 60 90)
             "flow": flow, # T 2 H W (13 2 60 90)
-            "traj": traj,# C H W (3 480 720)
+            "encoded_traj": encoded_traj,# T C H W (16 13 60 90)
             "video_metadata": {
                 "num_frames": encoded_video.shape[1],
                 "height": encoded_video.shape[2],

@@ -200,14 +200,59 @@ class Patchify3D(nn.Module):
 
         return x
 
-class TEFlowMGF(nn.Module):
+# class TEFlowMGF(nn.Module):
+#     def __init__(self, traj_c=16, flow_c=2, hidden=32):
+#         super().__init__()
+#         # 编码静态轨迹（空间）
+#         self.traj_embed = nn.Conv2d(traj_c, traj_c, 3, padding=1)
+#         # 编码光流（空间）
+#         self.flow_spatial = nn.Conv2d(flow_c, hidden, 3, padding=1)
+#         # 时间建模（关键）
+#         self.flow_temporal_gamma = zero_module(
+#             nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
+#         )
+#         self.flow_temporal_beta = zero_module(
+#             nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
+#         )
+#         self.norm = nn.GroupNorm(4, traj_c)
+
+#     def forward(self, traj, flow, control_scale):
+#         """
+#         traj: [B, C, H, W]
+#         flow: [B, 2, T, H, W]
+#         """
+#         B, _, T, H, W = flow.shape
+#         # ---- 1. 轨迹：静态空间编码 ----
+#         traj_feat = self.traj_embed(traj)  # [B, C, H, W]
+#         traj_feat = traj_feat.unsqueeze(2)  # [B, C, 1, H, W]
+#         # ---- 2. 光流：空间 → 时间 ----
+#         flow_ = rearrange(flow, "b c t h w -> (b t) c h w")
+#         flow_feat = self.flow_spatial(flow_)  # [(B*T), hidden, H, W]
+#         flow_feat = rearrange(
+#             flow_feat, "(b t) c h w -> (b h w) c t", t=T
+#         )
+#         gamma = self.flow_temporal_gamma(flow_feat)  # [(B*H*W), C, T]
+#         beta = self.flow_temporal_beta(flow_feat)
+#         gamma = rearrange(
+#             gamma, "(b h w) c t -> b c t h w", b=B, h=H, w=W
+#         )
+#         beta = rearrange(
+#             beta, "(b h w) c t -> b c t h w", b=B, h=H, w=W
+#         )
+#         # ---- 3. 静态 → 动态（FiLM）----
+#         traj_dynamic = traj_feat + control_scale * ( self.norm(traj_feat) * gamma + beta )
+#         return traj_dynamic
+class FlowConditionedTE(nn.Module):
+    """
+    将光流编码为条件信号，通过 FiLM 调制轨迹视频特征。
+    轨迹视频已经是逐帧的 [B, C, T, H, W]，不需要 warp。
+    光流提供全局视角运动的补充信息。
+    """
     def __init__(self, traj_c=16, flow_c=2, hidden=32):
         super().__init__()
-        # 编码静态轨迹（空间）
-        self.traj_embed = nn.Conv2d(traj_c, traj_c, 3, padding=1)
-        # 编码光流（空间）
+        # 光流空间编码
         self.flow_spatial = nn.Conv2d(flow_c, hidden, 3, padding=1)
-        # 时间建模（关键）
+        # 光流时间建模 → 生成 FiLM 参数
         self.flow_temporal_gamma = zero_module(
             nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
         )
@@ -216,32 +261,29 @@ class TEFlowMGF(nn.Module):
         )
         self.norm = nn.GroupNorm(4, traj_c)
 
-    def forward(self, traj, flow, control_scale):
+    def forward(self, traj_video, flow, control_scale):
         """
-        traj: [B, C, H, W]
-        flow: [B, 2, T, H, W]
+        traj_video: [B, C, T, H, W]  — 已经是逐帧轨迹视频的 VAE latent
+        flow:       [B, 2, T, H, W]  — 全局光流
         """
-        B, _, T, H, W = flow.shape
-        # ---- 1. 轨迹：静态空间编码 ----
-        traj_feat = self.traj_embed(traj)  # [B, C, H, W]
-        traj_feat = traj_feat.unsqueeze(2)  # [B, C, 1, H, W]
-        # ---- 2. 光流：空间 → 时间 ----
+        B, C, T, H, W = traj_video.shape
+
+        # 光流编码：空间 → 时间
         flow_ = rearrange(flow, "b c t h w -> (b t) c h w")
-        flow_feat = self.flow_spatial(flow_)  # [(B*T), hidden, H, W]
-        flow_feat = rearrange(
-            flow_feat, "(b t) c h w -> (b h w) c t", t=T
-        )
-        gamma = self.flow_temporal_gamma(flow_feat)  # [(B*H*W), C, T]
-        beta = self.flow_temporal_beta(flow_feat)
-        gamma = rearrange(
-            gamma, "(b h w) c t -> b c t h w", b=B, h=H, w=W
-        )
-        beta = rearrange(
-            beta, "(b h w) c t -> b c t h w", b=B, h=H, w=W
-        )
-        # ---- 3. 静态 → 动态（FiLM）----
-        traj_dynamic = traj_feat + control_scale * ( self.norm(traj_feat) * gamma + beta )
-        return traj_dynamic
+        flow_feat = self.flow_spatial(flow_)           # [(BT), hidden, H, W]
+        flow_feat = rearrange(flow_feat, "(b t) c h w -> (b h w) c t", t=T)
+
+        gamma = self.flow_temporal_gamma(flow_feat)     # [(BHW), C, T]
+        beta  = self.flow_temporal_beta(flow_feat)
+
+        gamma = rearrange(gamma, "(b h w) c t -> b c t h w", b=B, h=H, w=W)
+        beta  = rearrange(beta,  "(b h w) c t -> b c t h w", b=B, h=H, w=W)
+
+        # FiLM 调制：轨迹 + 光流条件
+        out = traj_video + control_scale * (self.norm(traj_video) * gamma + beta)
+        return out
+
+
 class TrajExtractor(nn.Module):
     def __init__(
         self,
@@ -256,7 +298,7 @@ class TrajExtractor(nn.Module):
         use_conv=True,
     ):
         super(TrajExtractor, self).__init__()
-        self.flow_modulator = TEFlowMGF(traj_c=cin, flow_c=2)
+        self.flow_modulator = FlowConditionedTE(traj_c=cin)
         self.vae_downsize = vae_downsize
         # self.vae_spatial_emulator = VAESpatialEmulator(kernel_size=vae_downsize[-2:])
         self.patch_size = (patch_size_t, patch_size, patch_size)

@@ -459,7 +459,7 @@ class Trainer:
                 with accelerator.accumulate(models_to_accumulate):
                     # These weighting schemes use a uniform timestep sampling and instead post-weight the loss
                     scale = control_warmup(global_step, self.args.lr_warmup_steps)
-                    loss = self.compute_loss(batch, scale)
+                    loss = self.compute_loss(batch, scale, global_step)
                     loss_value = loss.detach().item()
                     accelerator.backward(loss)
                     del loss #切断loss
@@ -886,6 +886,113 @@ class Trainer:
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
+
+    @torch.no_grad()
+    def _visualize_traj_warp(self, traj_latent, flows, step):
+        """
+        可视化 FlowConditionedTE 的效果：对比调制前后的轨迹视频
+        traj_latent: [B, 16, T, H_latent, W_latent]  (轨迹视频的 VAE latent)
+        flows:       [B, 2, T, H_latent, W_latent]    (全局光流)
+        """
+        if not self.accelerator.is_main_process or step % 200 != 0:
+            return
+
+        import os
+        from PIL import Image, ImageDraw, ImageFont
+
+        save_dir = os.path.join(str(self.args.output_dir), "traj_flow_vis")
+        os.makedirs(save_dir, exist_ok=True)
+
+        vae = self.components.vae
+        transformer = unwrap_model(self.accelerator, self.components.transformer)
+        traj_extractor = transformer.traj_extractor
+
+        # 统一 dtype
+        param_dtype = next(traj_extractor.parameters()).dtype
+        traj_input = traj_latent.to(dtype=param_dtype)  # [B, 16, T, H, W]
+        flows_vis = flows.to(dtype=param_dtype)
+
+        # 调制后的轨迹
+        traj_modulated = traj_extractor.flow_modulator(
+            traj_input, flows_vis, control_scale=1.0
+        )  # [B, 16, T, H, W]
+
+        B, C, T, H, W = traj_modulated.shape
+
+        def decode_frames(latent_5d):
+            """将 [B, C, T, H, W] 的 latent 逐帧解码为 PIL 图像列表"""
+            frames_pil = []
+            for t in range(latent_5d.shape[2]):
+                frame_latent = latent_5d[:1, :, t:t+1, :, :]  # [1, 16, 1, H, W]
+                frame_latent = frame_latent / vae.config.scaling_factor
+                decoded = vae.decode(frame_latent.to(dtype=vae.dtype)).sample  # [1, 3, 1, H*8, W*8]
+                decoded = decoded.squeeze(2)  # [1, 3, H*8, W*8]
+                decoded = ((decoded + 1) / 2).clamp(0, 1)
+                decoded = (decoded[0] * 255).byte().cpu().permute(1, 2, 0).numpy()
+                frames_pil.append(Image.fromarray(decoded))
+            return frames_pil
+
+        # 解码原始轨迹视频帧
+        frames_original = decode_frames(traj_input)
+        # 解码调制后轨迹视频帧
+        frames_modulated = decode_frames(traj_modulated)
+
+        # 拼接对比图：上行=原始，下行=调制后
+        cols = min(7, T)
+        rows_per_group = (T + cols - 1) // cols
+        w, h = frames_original[0].size
+
+        # 总高度 = 标签行高 + 原始帧行 + 间隔 + 标签行高 + 调制帧行
+        label_h = 30
+        gap = 10
+        total_h = label_h + h * rows_per_group + gap + label_h + h * rows_per_group
+        total_w = w * cols
+
+        grid = Image.new('RGB', (total_w, total_h), (40, 40, 40))
+        draw = ImageDraw.Draw(grid)
+
+        # 标签
+        try:
+            font = ImageFont.truetype("arial.ttf", 20)
+        except:
+            font = ImageFont.load_default()
+
+        draw.text((10, 5), f"Original Traj Video (step {step})", fill=(255, 255, 100), font=font)
+        draw.text((10, label_h + h * rows_per_group + gap + 5),
+                f"After Flow FiLM Modulation (step {step})", fill=(100, 255, 100), font=font)
+
+        # 贴原始帧
+        y_offset = label_h
+        for idx, frame in enumerate(frames_original):
+            r, c = divmod(idx, cols)
+            grid.paste(frame, (c * w, y_offset + r * h))
+
+        # 贴调制后帧
+        y_offset = label_h + h * rows_per_group + gap + label_h
+        for idx, frame in enumerate(frames_modulated):
+            r, c = divmod(idx, cols)
+            grid.paste(frame, (c * w, y_offset + r * h))
+
+        grid.save(os.path.join(save_dir, f"compare_step{step:06d}.png"))
+
+        # 额外：保存差异图（调制后 - 原始，放大显示）
+        frames_diff = []
+        for orig, mod in zip(frames_original, frames_modulated):
+            import numpy as np
+            orig_np = np.array(orig).astype(np.float32)
+            mod_np = np.array(mod).astype(np.float32)
+            diff = np.abs(mod_np - orig_np)
+            # 放大差异以便观察（×5 并 clamp）
+            diff = np.clip(diff * 5, 0, 255).astype(np.uint8)
+            frames_diff.append(Image.fromarray(diff))
+
+        diff_grid = Image.new('RGB', (w * cols, h * rows_per_group), (0, 0, 0))
+        for idx, frame in enumerate(frames_diff):
+            r, c = divmod(idx, cols)
+            diff_grid.paste(frame, (c * w, r * h))
+        diff_grid.save(os.path.join(save_dir, f"diff_step{step:06d}.png"))
+
+        print(f"[VIS] Saved traj modulation comparison to {save_dir}/compare_step{step:06d}.png")
 
     def __maybe_save_checkpoint(self, global_step: int, must_save: bool = False):
         if (
