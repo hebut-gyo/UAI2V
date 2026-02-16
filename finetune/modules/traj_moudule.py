@@ -348,7 +348,9 @@ class TrajExtractor(nn.Module):
         """
         x: torch.Tensor: shape [B C T H W]
         """
-        x = self.flow_modulator(traj_latent, flow.detach(), warmup_scale)
+        # 移除 detach：让 FiLM 参数能通过 predicted_flow 的梯度学习
+        # AuxHead 已冻结，不会被更新
+        x = self.flow_modulator(traj_latent, flow, warmup_scale)
         B, C, T, H, W = x.shape
         if W % self.patch_size[2] != 0:
             x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))

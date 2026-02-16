@@ -376,8 +376,8 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             shape = shape[:1] + (shape[1] + shape[1] % self.transformer.config.patch_size_t,) + shape[2:]
 
         image = image.unsqueeze(2)  # [B, C, F, H, W]
-        traj = traj.unsqueeze(2)
-        traj = traj.permute(0, 2, 1, 3, 4)
+        # traj = traj.unsqueeze(2)
+        # traj = traj.permute(0, 2, 1, 3, 4)
 
         if isinstance(generator, list):
             image_latents = [
@@ -390,7 +390,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         # TODO 轨迹图编码
         if traj is not None:
             traj_latents = (
-                retrieve_latents(self.vae.encode(traj.permute(0, 2, 1, 3, 4))).to(dtype)
+                retrieve_latents(self.vae.encode(traj)).to(dtype)
             )  # [B, C, F, H, W]
 
         if not self.vae.config.invert_scale_latents:
@@ -794,9 +794,15 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             device, dtype=prompt_embeds.dtype
         )
-        traj_static = self.video_processor.preprocess(traj_static, height=height, width=width).to(
-            device, dtype=prompt_embeds.dtype
-        )
+        # traj_static = self.video_processor.preprocess(traj_static, height=height, width=width).to(
+        #     device, dtype=prompt_embeds.dtype
+        # )
+        if traj_static is not None:
+            traj_static = traj_static.to(device=device, dtype=prompt_embeds.dtype)
+            # 如果没有 batch 维度，添加一个: [T, C, H, W] -> [B, C, T, H, W]
+            if traj_static.dim() == 4:
+                traj_static = traj_static.unsqueeze(0)           # [1, T, C, H, W]
+                traj_static = traj_static.permute(0, 2, 1, 3, 4) # [1, C, T, H, W]
 
         latent_channels = self.transformer.config.in_channels // 2
         latents, image_latents, traj_latents = self.prepare_latents(

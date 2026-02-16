@@ -290,17 +290,118 @@ class Trainer:
         # Make sure the trainable params are in float32
         cast_training_params([self.components.transformer], dtype=torch.float32)
 
-        # For LoRA, we only want to train the LoRA weights
-        # For SFT, we want to train all the parameters
-        trainable_parameters = list(
-            filter(lambda p: p.requires_grad, self.components.transformer.parameters())
+        # 分层学习率：零卷积层用更高学习率
+        transformer = self.components.transformer
+        
+        # 收集不同类型的参数
+        zero_conv_params = []  # 零卷积层（gamma/beta 的 temporal 层）
+        other_te_mgf_params = []  # 其他 TE/MGF 参数
+        lora_params = []  # LoRA 参数
+        other_params = []  # 其他可训练参数
+        
+        # 1. 收集零卷积层参数
+        if hasattr(transformer, 'traj_extractor'):
+            te = transformer.traj_extractor
+            if hasattr(te, 'flow_modulator'):
+                # FlowConditionedTE 的零卷积层
+                if hasattr(te.flow_modulator, 'flow_temporal_gamma'):
+                    zero_conv_params.extend(te.flow_modulator.flow_temporal_gamma.parameters())
+                if hasattr(te.flow_modulator, 'flow_temporal_beta'):
+                    zero_conv_params.extend(te.flow_modulator.flow_temporal_beta.parameters())
+        
+        if hasattr(transformer, 'fuser'):
+            # MGF 的零卷积层
+            for mgf in transformer.fuser:
+                if hasattr(mgf, 'flow_gamma_temporal'):
+                    zero_conv_params.extend(mgf.flow_gamma_temporal.parameters())
+                if hasattr(mgf, 'flow_beta_temporal'):
+                    zero_conv_params.extend(mgf.flow_beta_temporal.parameters())
+        
+        # 创建零卷积参数的 id 集合，用于后续过滤
+        zero_conv_param_ids = {id(p) for p in zero_conv_params}
+        
+        # 2. 收集其他 TE/MGF 参数（排除零卷积层）
+        if hasattr(transformer, 'traj_extractor'):
+            for param in transformer.traj_extractor.parameters():
+                if param.requires_grad and id(param) not in zero_conv_param_ids:
+                    other_te_mgf_params.append(param)
+        
+        if hasattr(transformer, 'fuser'):
+            for mgf in transformer.fuser:
+                for param in mgf.parameters():
+                    if param.requires_grad and id(param) not in zero_conv_param_ids:
+                        other_te_mgf_params.append(param)
+        
+        # 创建 TE/MGF 参数的 id 集合
+        te_mgf_param_ids = zero_conv_param_ids | {id(p) for p in other_te_mgf_params}
+        
+        # 3. 收集 LoRA 参数
+        for name, param in transformer.named_parameters():
+            if param.requires_grad and 'lora_' in name:
+                lora_params.append(param)
+        
+        lora_param_ids = {id(p) for p in lora_params}
+        
+        # 4. 收集其他可训练参数
+        for param in transformer.parameters():
+            if param.requires_grad and id(param) not in te_mgf_param_ids and id(param) not in lora_param_ids:
+                other_params.append(param)
+        
+        # 构建参数组（按优先级排序）
+        params_to_optimize = []
+        
+        # 零卷积层：最高学习率
+        if zero_conv_params:
+            zero_conv_lr = self.args.learning_rate * 10.0  # 3倍基础学习率
+            params_to_optimize.append({
+                "params": zero_conv_params,
+                "lr": zero_conv_lr,
+                "name": "zero_conv"
+            })
+            logger.info(f"Zero-conv layers: {len(zero_conv_params)} params, lr={zero_conv_lr:.2e}")
+        
+        # 其他 TE/MGF 参数：基础学习率
+        if other_te_mgf_params:
+            params_to_optimize.append({
+                "params": other_te_mgf_params,
+                "lr": self.args.learning_rate,
+                "name": "te_mgf"
+            })
+            logger.info(f"Other TE/MGF layers: {len(other_te_mgf_params)} params, lr={self.args.learning_rate:.2e}")
+        
+        # LoRA 参数：较低学习率
+        if lora_params:
+            lora_lr = self.args.learning_rate * 0.5  # 0.5倍基础学习率
+            params_to_optimize.append({
+                "params": lora_params,
+                "lr": lora_lr,
+                "name": "lora"
+            })
+            logger.info(f"LoRA layers: {len(lora_params)} params, lr={lora_lr:.2e}")
+        
+        # 其他参数：基础学习率
+        if other_params:
+            params_to_optimize.append({
+                "params": other_params,
+                "lr": self.args.learning_rate,
+                "name": "other"
+            })
+            logger.info(f"Other layers: {len(other_params)} params, lr={self.args.learning_rate:.2e}")
+        
+        # 如果没有分层参数，回退到原始方式
+        if not params_to_optimize:
+            trainable_parameters = list(
+                filter(lambda p: p.requires_grad, transformer.parameters())
+            )
+            params_to_optimize = [{
+                "params": trainable_parameters,
+                "lr": self.args.learning_rate,
+            }]
+        
+        # 计算总可训练参数数量
+        self.state.num_trainable_parameters = sum(
+            p.numel() for group in params_to_optimize for p in group["params"]
         )
-        transformer_parameters_with_lr = {
-            "params": trainable_parameters,
-            "lr": self.args.learning_rate,
-        }
-        params_to_optimize = [transformer_parameters_with_lr]
-        self.state.num_trainable_parameters = sum(p.numel() for p in trainable_parameters)
 
         use_deepspeed_opt = (
             self.accelerator.state.deepspeed_plugin is not None
@@ -974,12 +1075,16 @@ class Trainer:
 
     @torch.no_grad()
     def _visualize_traj_warp(self, traj_latent, flows, step):
+        gamma_w = self.components.transformer.traj_extractor.flow_modulator.flow_temporal_gamma.weight
+        beta_w = self.components.transformer.traj_extractor.flow_modulator.flow_temporal_beta.weight
+        print(f"[FiLM Stats] gamma: mean={gamma_w.abs().mean():.6f}, max={gamma_w.abs().max():.6f}")
+        print(f"[FiLM Stats] beta: mean={beta_w.abs().mean():.6f}, max={beta_w.abs().max():.6f}")
         """
         可视化 FlowConditionedTE 的效果：对比调制前后的轨迹视频
         traj_latent: [B, 16, T, H_latent, W_latent]  (轨迹视频的 VAE latent)
         flows:       [B, 2, T, H_latent, W_latent]    (全局光流)
         """
-        if not self.accelerator.is_main_process or step % 200 != 0:
+        if not self.accelerator.is_main_process or step % 50 != 0:
             return
 
         import os

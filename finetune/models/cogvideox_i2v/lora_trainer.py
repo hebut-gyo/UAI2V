@@ -239,7 +239,7 @@ class CogVideoXI2VLoraTrainer(Trainer):
             else latent.new_full((1,), fill_value=2.0)
         )
 
-        if self.accelerator.is_main_process and global_step % 100 == 0:  # 每100步可视化一次
+        if self.accelerator.is_main_process:
             self._visualize_traj_warp(trajs_latents, flows, global_step)
         predicted_noise = self.components.transformer(
             hidden_states=latent_img_noisy,
