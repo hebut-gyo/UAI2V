@@ -245,9 +245,19 @@ class Trainer:
                     component.requires_grad_(False)
         if self.args.training_type == "frozen_backbone":
             if self.args.tfe_mgf_enable:
+                tfe_path = "./flow_modulator_epoch_999.pth"
+                if os.path.exists(tfe_path) and hasattr(self.components.transformer.traj_extractor, "flow_modulator"):
+                    checkpoint = torch.load(str(tfe_path), map_location="cpu")
+                    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                        sd = checkpoint["model_state_dict"]
+                    else:
+                        sd = checkpoint
+                    self.components.transformer.traj_extractor.flow_modulator.load_state_dict(sd, strict=True)
+                    logger.info(f"[CKPT] load_aux_head done <- {str(tfe_path)}", main_process_only=True)
                 self.components.transformer.traj_extractor.requires_grad_(True)
-                for m in self.components.transformer.fuser:
-                    m.requires_grad_(True)
+                self.components.transformer.traj_extractor.flow_modulator.requires_grad_(False)
+                for mgf in self.components.transformer.fuser:
+                    mgf.requires_grad_(True)
             if self.args.aux_head_enable:
                 aux_path = "./aux_head_best.pth"
                 if os.path.exists(aux_path) and hasattr(self.components.transformer, "aux_head"):
@@ -300,14 +310,14 @@ class Trainer:
         other_params = []  # 其他可训练参数
         
         # 1. 收集零卷积层参数
-        if hasattr(transformer, 'traj_extractor'):
-            te = transformer.traj_extractor
-            if hasattr(te, 'flow_modulator'):
-                # FlowConditionedTE 的零卷积层
-                if hasattr(te.flow_modulator, 'flow_temporal_gamma'):
-                    zero_conv_params.extend(te.flow_modulator.flow_temporal_gamma.parameters())
-                if hasattr(te.flow_modulator, 'flow_temporal_beta'):
-                    zero_conv_params.extend(te.flow_modulator.flow_temporal_beta.parameters())
+        # if hasattr(transformer, 'traj_extractor'):
+        #     te = transformer.traj_extractor
+        #     if hasattr(te, 'flow_modulator'):
+        #         # FlowConditionedTE 的零卷积层
+        #         if hasattr(te.flow_modulator, 'flow_temporal_gamma'):
+        #             zero_conv_params.extend(te.flow_modulator.flow_temporal_gamma.parameters())
+        #         if hasattr(te.flow_modulator, 'flow_temporal_beta'):
+        #             zero_conv_params.extend(te.flow_modulator.flow_temporal_beta.parameters())
         
         if hasattr(transformer, 'fuser'):
             # MGF 的零卷积层
@@ -322,9 +332,18 @@ class Trainer:
         
         # 2. 收集其他 TE/MGF 参数（排除零卷积层）
         if hasattr(transformer, 'traj_extractor'):
-            for param in transformer.traj_extractor.parameters():
-                if param.requires_grad and id(param) not in zero_conv_param_ids:
-                    other_te_mgf_params.append(param)
+            te = transformer.traj_extractor
+            # ✅ 只收集 body 和 conv_in 的参数（排除 flow_modulator）
+            if hasattr(te, 'body'):
+                for module in te.body:
+                    for param in module.parameters():
+                        if param.requires_grad and id(param) not in zero_conv_param_ids:
+                            other_te_mgf_params.append(param)
+            
+            if hasattr(te, 'conv_in'):
+                for param in te.conv_in.parameters():
+                    if param.requires_grad and id(param) not in zero_conv_param_ids:
+                        other_te_mgf_params.append(param)
         
         if hasattr(transformer, 'fuser'):
             for mgf in transformer.fuser:
@@ -1075,20 +1094,19 @@ class Trainer:
 
     @torch.no_grad()
     def _visualize_traj_warp(self, traj_latent, flows, step):
-        gamma_w = self.components.transformer.traj_extractor.flow_modulator.flow_temporal_gamma.weight
-        beta_w = self.components.transformer.traj_extractor.flow_modulator.flow_temporal_beta.weight
-        print(f"[FiLM Stats] gamma: mean={gamma_w.abs().mean():.6f}, max={gamma_w.abs().max():.6f}")
-        print(f"[FiLM Stats] beta: mean={beta_w.abs().mean():.6f}, max={beta_w.abs().max():.6f}")
         """
-        可视化 FlowConditionedTE 的效果：对比调制前后的轨迹视频
+        可视化 TrajectoryConstrainedMotion 的效果：对比调制前后的轨迹视频
         traj_latent: [B, 16, T, H_latent, W_latent]  (轨迹视频的 VAE latent)
         flows:       [B, 2, T, H_latent, W_latent]    (全局光流)
         """
-        if not self.accelerator.is_main_process or step % 50 != 0:
+        if not self.accelerator.is_main_process or step % 10 != 0:
             return
 
         import os
         from PIL import Image, ImageDraw, ImageFont
+
+        # 修复：访问正确的属性
+        flow_modulator = self.components.transformer.traj_extractor.flow_modulator
 
         save_dir = os.path.join(str(self.args.output_dir), "traj_flow_vis")
         os.makedirs(save_dir, exist_ok=True)
@@ -1102,7 +1120,7 @@ class Trainer:
         traj_input = traj_latent.to(dtype=param_dtype)  # [B, 16, T, H, W]
         flows_vis = flows.to(dtype=param_dtype)
 
-        # 调制后的轨迹
+        # 调制后的轨迹（这部分是正确的）
         traj_modulated = traj_extractor.flow_modulator(
             traj_input, flows_vis, control_scale=1.0
         )  # [B, 16, T, H, W]
@@ -1149,7 +1167,7 @@ class Trainer:
 
         draw.text((10, 5), f"Original Traj Video (step {step})", fill=(255, 255, 100), font=font)
         draw.text((10, label_h + h * rows_per_group + gap + 5),
-                f"After Flow FiLM Modulation (step {step})", fill=(100, 255, 100), font=font)
+                f"After Flow Constraint Modulation (step {step})", fill=(100, 255, 100), font=font)
 
         # 贴原始帧
         y_offset = label_h
