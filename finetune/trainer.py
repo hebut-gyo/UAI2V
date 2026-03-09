@@ -255,16 +255,8 @@ class Trainer:
                     self.components.transformer.traj_extractor.flow_modulator.load_state_dict(sd, strict=True)
                     logger.info(f"[CKPT] load_aux_head done <- {str(tfe_path)}", main_process_only=True)
                 self.components.transformer.traj_extractor.requires_grad_(True)
-                self.components.transformer.traj_extractor.flow_modulator.requires_grad_(False)
                 for mgf in self.components.transformer.fuser:
                     mgf.requires_grad_(True)
-            if self.args.aux_head_enable:
-                aux_path = "./aux_head_best.pth"
-                if os.path.exists(aux_path) and hasattr(self.components.transformer, "aux_head"):
-                    sd = torch.load(str(aux_path), map_location="cpu")
-                    self.components.transformer.aux_head.load_state_dict(sd, strict=True)
-                    self.components.transformer.aux_head.requires_grad_(False)
-                    logger.info(f"[CKPT] load_aux_head done <- {str(aux_path)}", main_process_only=True)
             self.__prepare_saving_loading_hooks_no_lora()
         if self.args.training_type == "lora" or self.args.training_type == "lora_flow":
             transformer_lora_config = LoraConfig(
@@ -306,7 +298,6 @@ class Trainer:
         # 收集不同类型的参数
         zero_conv_params = []  # 零卷积层（gamma/beta 的 temporal 层）
         other_te_mgf_params = []  # 其他 TE/MGF 参数
-        lora_params = []  # LoRA 参数
         other_params = []  # 其他可训练参数
         
         # 1. 收集零卷积层参数
@@ -333,17 +324,9 @@ class Trainer:
         # 2. 收集其他 TE/MGF 参数（排除零卷积层）
         if hasattr(transformer, 'traj_extractor'):
             te = transformer.traj_extractor
-            # ✅ 只收集 body 和 conv_in 的参数（排除 flow_modulator）
-            if hasattr(te, 'body'):
-                for module in te.body:
-                    for param in module.parameters():
-                        if param.requires_grad and id(param) not in zero_conv_param_ids:
-                            other_te_mgf_params.append(param)
-            
-            if hasattr(te, 'conv_in'):
-                for param in te.conv_in.parameters():
-                    if param.requires_grad and id(param) not in zero_conv_param_ids:
-                        other_te_mgf_params.append(param)
+            for param in te.parameters():
+                if param.requires_grad and id(param) not in zero_conv_param_ids:
+                    other_te_mgf_params.append(param)
         
         if hasattr(transformer, 'fuser'):
             for mgf in transformer.fuser:
@@ -354,16 +337,9 @@ class Trainer:
         # 创建 TE/MGF 参数的 id 集合
         te_mgf_param_ids = zero_conv_param_ids | {id(p) for p in other_te_mgf_params}
         
-        # 3. 收集 LoRA 参数
-        for name, param in transformer.named_parameters():
-            if param.requires_grad and 'lora_' in name:
-                lora_params.append(param)
-        
-        lora_param_ids = {id(p) for p in lora_params}
-        
         # 4. 收集其他可训练参数
         for param in transformer.parameters():
-            if param.requires_grad and id(param) not in te_mgf_param_ids and id(param) not in lora_param_ids:
+            if param.requires_grad and id(param) not in te_mgf_param_ids:
                 other_params.append(param)
         
         # 构建参数组（按优先级排序）
@@ -371,7 +347,7 @@ class Trainer:
         
         # 零卷积层：最高学习率
         if zero_conv_params:
-            zero_conv_lr = self.args.learning_rate * 10.0  # 3倍基础学习率
+            zero_conv_lr = self.args.learning_rate * 1.0  # 3倍基础学习率
             params_to_optimize.append({
                 "params": zero_conv_params,
                 "lr": zero_conv_lr,
@@ -387,16 +363,6 @@ class Trainer:
                 "name": "te_mgf"
             })
             logger.info(f"Other TE/MGF layers: {len(other_te_mgf_params)} params, lr={self.args.learning_rate:.2e}")
-        
-        # LoRA 参数：较低学习率
-        if lora_params:
-            lora_lr = self.args.learning_rate * 0.5  # 0.5倍基础学习率
-            params_to_optimize.append({
-                "params": lora_params,
-                "lr": lora_lr,
-                "name": "lora"
-            })
-            logger.info(f"LoRA layers: {len(lora_params)} params, lr={lora_lr:.2e}")
         
         # 其他参数：基础学习率
         if other_params:
@@ -607,12 +573,6 @@ class Trainer:
                             c += 1
                         return s, c, none
 
-                    # 只看 LoRA
-                    lora_s, lora_c, lora_none = stat(
-                        self.components.transformer.named_parameters(),
-                        lambda n: "lora_" in n
-                    )
-
                     te_s, te_c, te_none = stat(
                         self.components.transformer.named_parameters(),
                         lambda n: "traj_extractor" in n
@@ -622,11 +582,9 @@ class Trainer:
                         self.components.transformer.named_parameters(),
                         lambda n: "fuser" in n
                     )
-                    logs["lora_grad"] = lora_s
                     logs["te_grad"] = te_s
                     logs["mgf_grad"] = mgf_s
                     print(
-                        f"[GRAD] lora mean-sum={lora_s:.2e}, cnt={lora_c}, none={lora_none} \n"
                         f"[GRAD] te_grad mean-sum={te_s:.2e}, cnt={te_c}, none={te_none}\n"
                         f"[GRAD] mgf_grad mean-sum={mgf_s:.2e}, cnt={mgf_c}, none={mgf_none}\n"
                     )
@@ -955,12 +913,6 @@ class Trainer:
                         transformer.fuser.state_dict(), str(mgf_path)
                     )
 
-                # if hasattr(transformer, "aux_head"):
-                #     aux_path = output_dir / "aux_head.safetensors"
-                #     safe_save_file(
-                #         transformer.aux_head.state_dict(), str(aux_path)
-                #     )
-
                 logger.info(
                     f"[CKPT] save_model_hook (no-lora) done -> {str(output_dir)}",
                     main_process_only=True,
@@ -985,12 +937,6 @@ class Trainer:
                 sd = safe_load_file(str(mgf_path))
                 transformer.fuser.load_state_dict(sd, strict=True)
                 logger.info(f"[CKPT] loaded fuser <- {mgf_path}")
-
-            aux_path = input_dir / "aux_head.safetensors"
-            if aux_path.exists() and hasattr(transformer, "aux_head"):
-                sd = safe_load_file(str(aux_path))
-                transformer.aux_head.load_state_dict(sd, strict=True)
-                logger.info(f"[CKPT] loaded aux_head <- {aux_path}")
 
             logger.info(
                 f"[CKPT] load_model_hook (no-lora) done <- {str(input_dir)}",
@@ -1092,115 +1038,6 @@ class Trainer:
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
-    @torch.no_grad()
-    def _visualize_traj_warp(self, traj_latent, flows, step):
-        """
-        可视化 TrajectoryConstrainedMotion 的效果：对比调制前后的轨迹视频
-        traj_latent: [B, 16, T, H_latent, W_latent]  (轨迹视频的 VAE latent)
-        flows:       [B, 2, T, H_latent, W_latent]    (全局光流)
-        """
-        if not self.accelerator.is_main_process or step % 10 != 0:
-            return
-
-        import os
-        from PIL import Image, ImageDraw, ImageFont
-
-        # 修复：访问正确的属性
-        flow_modulator = self.components.transformer.traj_extractor.flow_modulator
-
-        save_dir = os.path.join(str(self.args.output_dir), "traj_flow_vis")
-        os.makedirs(save_dir, exist_ok=True)
-
-        vae = self.components.vae
-        transformer = unwrap_model(self.accelerator, self.components.transformer)
-        traj_extractor = transformer.traj_extractor
-
-        # 统一 dtype
-        param_dtype = next(traj_extractor.parameters()).dtype
-        traj_input = traj_latent.to(dtype=param_dtype)  # [B, 16, T, H, W]
-        flows_vis = flows.to(dtype=param_dtype)
-
-        # 调制后的轨迹（这部分是正确的）
-        traj_modulated = traj_extractor.flow_modulator(
-            traj_input, flows_vis, control_scale=1.0
-        )  # [B, 16, T, H, W]
-
-        B, C, T, H, W = traj_modulated.shape
-
-        def decode_frames(latent_5d):
-            """将 [B, C, T, H, W] 的 latent 逐帧解码为 PIL 图像列表"""
-            frames_pil = []
-            for t in range(latent_5d.shape[2]):
-                frame_latent = latent_5d[:1, :, t:t+1, :, :]  # [1, 16, 1, H, W]
-                frame_latent = frame_latent / vae.config.scaling_factor
-                decoded = vae.decode(frame_latent.to(dtype=vae.dtype)).sample  # [1, 3, 1, H*8, W*8]
-                decoded = decoded.squeeze(2)  # [1, 3, H*8, W*8]
-                decoded = ((decoded + 1) / 2).clamp(0, 1)
-                decoded = (decoded[0] * 255).byte().cpu().permute(1, 2, 0).numpy()
-                frames_pil.append(Image.fromarray(decoded))
-            return frames_pil
-
-        # 解码原始轨迹视频帧
-        frames_original = decode_frames(traj_input)
-        # 解码调制后轨迹视频帧
-        frames_modulated = decode_frames(traj_modulated)
-
-        # 拼接对比图：上行=原始，下行=调制后
-        cols = min(7, T)
-        rows_per_group = (T + cols - 1) // cols
-        w, h = frames_original[0].size
-
-        # 总高度 = 标签行高 + 原始帧行 + 间隔 + 标签行高 + 调制帧行
-        label_h = 30
-        gap = 10
-        total_h = label_h + h * rows_per_group + gap + label_h + h * rows_per_group
-        total_w = w * cols
-
-        grid = Image.new('RGB', (total_w, total_h), (40, 40, 40))
-        draw = ImageDraw.Draw(grid)
-
-        # 标签
-        try:
-            font = ImageFont.truetype("arial.ttf", 20)
-        except:
-            font = ImageFont.load_default()
-
-        draw.text((10, 5), f"Original Traj Video (step {step})", fill=(255, 255, 100), font=font)
-        draw.text((10, label_h + h * rows_per_group + gap + 5),
-                f"After Flow Constraint Modulation (step {step})", fill=(100, 255, 100), font=font)
-
-        # 贴原始帧
-        y_offset = label_h
-        for idx, frame in enumerate(frames_original):
-            r, c = divmod(idx, cols)
-            grid.paste(frame, (c * w, y_offset + r * h))
-
-        # 贴调制后帧
-        y_offset = label_h + h * rows_per_group + gap + label_h
-        for idx, frame in enumerate(frames_modulated):
-            r, c = divmod(idx, cols)
-            grid.paste(frame, (c * w, y_offset + r * h))
-
-        grid.save(os.path.join(save_dir, f"compare_step{step:06d}.png"))
-
-        # 额外：保存差异图（调制后 - 原始，放大显示）
-        frames_diff = []
-        for orig, mod in zip(frames_original, frames_modulated):
-            import numpy as np
-            orig_np = np.array(orig).astype(np.float32)
-            mod_np = np.array(mod).astype(np.float32)
-            diff = np.abs(mod_np - orig_np)
-            # 放大差异以便观察（×5 并 clamp）
-            diff = np.clip(diff * 5, 0, 255).astype(np.uint8)
-            frames_diff.append(Image.fromarray(diff))
-
-        diff_grid = Image.new('RGB', (w * cols, h * rows_per_group), (0, 0, 0))
-        for idx, frame in enumerate(frames_diff):
-            r, c = divmod(idx, cols)
-            diff_grid.paste(frame, (c * w, r * h))
-        diff_grid.save(os.path.join(save_dir, f"diff_step{step:06d}.png"))
-
-        print(f"[VIS] Saved traj modulation comparison to {save_dir}/compare_step{step:06d}.png")
 
     def __maybe_save_checkpoint(self, global_step: int, must_save: bool = False):
         if (

@@ -346,7 +346,6 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         self,
         image: torch.Tensor,
         batch_size: int = 1,
-        traj: torch.Tensor = None,
         num_channels_latents: int = 16,
         num_frames: int = 13,
         height: int = 60,
@@ -376,8 +375,6 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             shape = shape[:1] + (shape[1] + shape[1] % self.transformer.config.patch_size_t,) + shape[2:]
 
         image = image.unsqueeze(2)  # [B, C, F, H, W]
-        # traj = traj.unsqueeze(2)
-        # traj = traj.permute(0, 2, 1, 3, 4)
 
         if isinstance(generator, list):
             image_latents = [
@@ -387,11 +384,6 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             image_latents = [retrieve_latents(self.vae.encode(img.unsqueeze(0)), generator) for img in image]
 
         image_latents = torch.cat(image_latents, dim=0).to(dtype).permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-        # TODO 轨迹图编码
-        if traj is not None:
-            traj_latents = (
-                retrieve_latents(self.vae.encode(traj)).to(dtype)
-            )  # [B, C, F, H, W]
 
         if not self.vae.config.invert_scale_latents:
             image_latents = self.vae_scaling_factor_image * image_latents
@@ -399,9 +391,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             # This is awkward but required because the CogVideoX team forgot to multiply the
             # scaling factor during training :)
             image_latents = 1 / self.vae_scaling_factor_image * image_latents
-        # TODO 轨迹图缩放
-        if not self.vae.config.invert_scale_latents and traj_latents is not None:
-            traj_latents = self.vae_scaling_factor_image * traj_latents
+
         padding_shape = (
             batch_size,
             num_frames - 1,
@@ -425,7 +415,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
-        return latents, image_latents, traj_latents
+        return latents, image_latents
 
     # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline.decode_latents
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
@@ -613,8 +603,8 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         image: PipelineImageInput,
         prompt: Optional[Union[str, List[str]]] = None,
         # TODO 补充输入
-        traj_static: Optional[torch.Tensor] = None,
-        video_flow: Optional[torch.FloatTensor] = None,
+        static_flow: Optional[torch.Tensor] = None,
+        camera_flow : Optional[torch.FloatTensor] = None,
         # TODO 运动注入后一半的块
         motion_block_range: Optional[Tuple[int, int]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -794,21 +784,11 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             device, dtype=prompt_embeds.dtype
         )
-        # traj_static = self.video_processor.preprocess(traj_static, height=height, width=width).to(
-        #     device, dtype=prompt_embeds.dtype
-        # )
-        if traj_static is not None:
-            traj_static = traj_static.to(device=device, dtype=prompt_embeds.dtype)
-            # 如果没有 batch 维度，添加一个: [T, C, H, W] -> [B, C, T, H, W]
-            if traj_static.dim() == 4:
-                traj_static = traj_static.unsqueeze(0)           # [1, T, C, H, W]
-                traj_static = traj_static.permute(0, 2, 1, 3, 4) # [1, C, T, H, W]
 
         latent_channels = self.transformer.config.in_channels // 2
-        latents, image_latents, traj_latents = self.prepare_latents(
+        latents, image_latents = self.prepare_latents(
             image,
             batch_size * num_videos_per_prompt,
-            traj_static,
             latent_channels,
             num_frames,
             height,
@@ -849,13 +829,11 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
                 latent_model_input = torch.cat([latent_model_input, latent_image_input], dim=2)
 
                 if do_classifier_free_guidance:
-                    traj_input = torch.cat([traj_latents, traj_latents], dim=0) if traj_latents is not None else None
-                    flow_input = torch.cat([video_flow, video_flow], dim=0) if video_flow is not None else None
+                    static_flow_input = torch.cat([static_flow, static_flow], dim=0) if static_flow is not None else None
+                    camera_flow_input = torch.cat([camera_flow, camera_flow], dim=0) if camera_flow is not None else None
                 else:
-                    traj_input = traj_latents
-                    flow_input = video_flow
-                # traj_input = traj_latents
-                # flow_input = video_flow
+                    static_flow_input = static_flow
+                    camera_flow_input = camera_flow
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
@@ -866,8 +844,8 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
                         hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds,
                         # 传入轨迹图和光流场
-                        traj_static=traj_input,
-                        video_flow=flow_input,
+                        static_flow=static_flow_input,
+                        camera_flow=camera_flow_input,
                         timestep=timestep,
                         ofs=ofs_emb,
                         image_rotary_emb=image_rotary_emb,

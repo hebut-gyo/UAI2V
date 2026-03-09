@@ -123,24 +123,24 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "flows": [], "encoded_trajs": []}
+        ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "camera_flows": [], "static_flows": []}
 
         for sample in samples:
             encoded_video = sample["encoded_video"]
             prompt_embedding = sample["prompt_embedding"]
             image = sample["image"]
-            flow = sample["flow"]
-            traj = sample["encoded_traj"]
+            camera_flow = sample["camera_flow"]
+            static_flow = sample["static_flow"]
             ret["encoded_videos"].append(encoded_video)
             ret["prompt_embedding"].append(prompt_embedding)
             ret["images"].append(image)
-            ret["flows"].append(flow)
-            ret["encoded_trajs"].append(traj)
+            ret["camera_flows"].append(camera_flow)
+            ret["static_flows"].append(static_flow)
         ret["encoded_videos"] = torch.stack(ret["encoded_videos"])
         ret["prompt_embedding"] = torch.stack(ret["prompt_embedding"])
         ret["images"] = torch.stack(ret["images"])
-        ret["flows"] = torch.stack(ret["flows"])
-        ret["encoded_trajs"] = torch.stack(ret["encoded_trajs"])
+        ret["camera_flows"] = torch.stack(ret["camera_flows"])
+        ret["static_flows"] = torch.stack(ret["static_flows"])
         return ret
 
     @override
@@ -148,8 +148,8 @@ class CogVideoXI2VLoraTrainer(Trainer):
         prompt_embedding = batch["prompt_embedding"]
         latent = batch["encoded_videos"]
         images = batch["images"]
-        flows = batch["flows"]
-        trajs_latents = batch["encoded_trajs"]
+        camera_flows = batch["camera_flows"]
+        static_flows = batch["static_flows"]
 
         # Shape of prompt_embedding: [B, seq_len, hidden_size]
         # Shape of latent: [B, C, F, H, W]
@@ -169,7 +169,8 @@ class CogVideoXI2VLoraTrainer(Trainer):
         # Get prompt embeddings
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
-        flows = flows.to(device=self.accelerator.device, dtype=latent.dtype)
+        camera_flows = camera_flows.to(device=self.accelerator.device, dtype=latent.dtype)
+        static_flows = static_flows.to(device=self.accelerator.device, dtype=latent.dtype)
         # Add frame dimension to images [B,C,H,W] -> [B,C,F,H,W]
         images = images.unsqueeze(2)
         # Add noise to images
@@ -239,14 +240,12 @@ class CogVideoXI2VLoraTrainer(Trainer):
             else latent.new_full((1,), fill_value=2.0)
         )
 
-        if self.accelerator.is_main_process:
-            self._visualize_traj_warp(trajs_latents, flows, global_step)
         predicted_noise = self.components.transformer(
             hidden_states=latent_img_noisy,
             encoder_hidden_states=prompt_embedding,
-            traj_static=trajs_latents,
+            static_flow=static_flows,
             warmup_scale=scale,
-            video_flow=flows,
+            camera_flow=camera_flows,
             timestep=timesteps,
             ofs=ofs_emb,
             image_rotary_emb=rotary_emb,
@@ -321,4 +320,4 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
         return freqs_cos, freqs_sin
 
-register("cogvideox-i2v", "lora_flow", CogVideoXI2VLoraTrainer)
+register("cogvideox-i2v", "frozen_backbone", CogVideoXI2VLoraTrainer)

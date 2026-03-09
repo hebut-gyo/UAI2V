@@ -13,9 +13,7 @@ class Args(BaseModel):
     model_name: str
     model_type: Literal["i2v", "t2v"]
     training_type: Literal["lora", "sft", "lora_flow","frozen_backbone"] = "lora_flow"
-    aux_head_enable: bool = False
-    aux_head_lambda: float = 0.01
-    mediators_attention_enable: bool = False
+
     tfe_mgf_enable: bool = False
     motion_block_range: Tuple[int, int] = None
     ########## Output ##########
@@ -79,7 +77,6 @@ class Args(BaseModel):
     rank: int = 128
     lora_alpha: int = 64
     target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0"]
-    modules_to_save: List[str] = ["flow_head"]
 
     ########## Validation ##########
     do_validation: bool = False
@@ -235,14 +232,6 @@ class Args(BaseModel):
         parser.add_argument(
             "--target_modules", type=str, nargs="+", default=["to_q", "to_k", "to_v", "to_out.0"]
         )
-        parser.add_argument(
-            "--modules_to_save", type=str, nargs="+", default=["flow_head"]
-        )
-        parser.add_argument("--aux_head_enable", action="store_true")
-        parser.add_argument(
-            "--aux_head_lambda", type=float, default=0.01
-        )
-        parser.add_argument("--mediators_attention_enable", action="store_true")
         parser.add_argument("--tfe_mgf_enable", action="store_true")
         parser.add_argument("--motion_block_range", type=str, default=None)
         # Checkpointing

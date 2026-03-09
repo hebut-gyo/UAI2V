@@ -200,445 +200,113 @@ class Patchify3D(nn.Module):
 
         return x
 
-# class TEFlowMGF(nn.Module):
-#     def __init__(self, traj_c=16, flow_c=2, hidden=32):
-#         super().__init__()
-#         # 编码静态轨迹（空间）
-#         self.traj_embed = nn.Conv2d(traj_c, traj_c, 3, padding=1)
-#         # 编码光流（空间）
-#         self.flow_spatial = nn.Conv2d(flow_c, hidden, 3, padding=1)
-#         # 时间建模（关键）
-#         self.flow_temporal_gamma = zero_module(
-#             nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
-#         )
-#         self.flow_temporal_beta = zero_module(
-#             nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
-#         )
-#         self.norm = nn.GroupNorm(4, traj_c)
-
-#     def forward(self, traj, flow, control_scale):
-#         """
-#         traj: [B, C, H, W]
-#         flow: [B, 2, T, H, W]
-#         """
-#         B, _, T, H, W = flow.shape
-#         # ---- 1. 轨迹：静态空间编码 ----
-#         traj_feat = self.traj_embed(traj)  # [B, C, H, W]
-#         traj_feat = traj_feat.unsqueeze(2)  # [B, C, 1, H, W]
-#         # ---- 2. 光流：空间 → 时间 ----
-#         flow_ = rearrange(flow, "b c t h w -> (b t) c h w")
-#         flow_feat = self.flow_spatial(flow_)  # [(B*T), hidden, H, W]
-#         flow_feat = rearrange(
-#             flow_feat, "(b t) c h w -> (b h w) c t", t=T
-#         )
-#         gamma = self.flow_temporal_gamma(flow_feat)  # [(B*H*W), C, T]
-#         beta = self.flow_temporal_beta(flow_feat)
-#         gamma = rearrange(
-#             gamma, "(b h w) c t -> b c t h w", b=B, h=H, w=W
-#         )
-#         beta = rearrange(
-#             beta, "(b h w) c t -> b c t h w", b=B, h=H, w=W
-#         )
-#         # ---- 3. 静态 → 动态（FiLM）----
-#         traj_dynamic = traj_feat + control_scale * ( self.norm(traj_feat) * gamma + beta )
-#         return traj_dynamic
-class FlowConditionedTE(nn.Module):
-    """
-    将光流编码为条件信号，通过 FiLM 调制轨迹视频特征。
-    轨迹视频已经是逐帧的 [B, C, T, H, W]，不需要 warp。
-    光流提供全局视角运动的补充信息。
-    """
-    def __init__(self, traj_c=16, flow_c=2, hidden=32):
-        super().__init__()
-        # 光流空间编码
-        self.flow_spatial = nn.Conv2d(flow_c, hidden, 3, padding=1)
-        # 光流时间建模 → 生成 FiLM 参数
-        self.flow_temporal_gamma = zero_module(
-            nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
-        )
-        self.flow_temporal_beta = zero_module(
-            nn.Conv1d(hidden, traj_c, kernel_size=3, padding=1)
-        )
-        self.norm = nn.GroupNorm(4, traj_c)
-
-    def forward(self, traj_video, flow, control_scale):
-        """
-        traj_video: [B, C, T, H, W]  — 已经是逐帧轨迹视频的 VAE latent
-        flow:       [B, 2, T, H, W]  — 全局光流
-        """
-        B, C, T, H, W = traj_video.shape
-
-        # 光流编码：空间 → 时间
-        flow_ = rearrange(flow, "b c t h w -> (b t) c h w")
-        flow_feat = self.flow_spatial(flow_)           # [(BT), hidden, H, W]
-        flow_feat = rearrange(flow_feat, "(b t) c h w -> (b h w) c t", t=T)
-
-        gamma = self.flow_temporal_gamma(flow_feat)     # [(BHW), C, T]
-        beta  = self.flow_temporal_beta(flow_feat)
-
-        gamma = rearrange(gamma, "(b h w) c t -> b c t h w", b=B, h=H, w=W)
-        beta  = rearrange(beta,  "(b h w) c t -> b c t h w", b=B, h=H, w=W)
-
-        # FiLM 调制：轨迹 + 光流条件
-        out = traj_video + control_scale * (self.norm(traj_video) * gamma + beta)
-        return out
-
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class FlowWarpModulator(nn.Module):
+class MyTrajExtractor(nn.Module):
     """
-    基于光流 Warp 的轨迹调制器
-    
-    核心思想：使用光流对静态轨迹进行空间变换
+    简化版轨迹提取器,专为固定尺寸光流设计
+    输入: flow [B, 2, 13, 60, 90]
+    输出: 多尺度特征 List[[BT, C, H, W]] 用于 MGF
     """
-    def __init__(self, traj_c=16, flow_c=2, hidden=64):
+    def __init__(
+        self,
+        flow_c=2,
+        num_frames=13,
+        spatial_size=(60, 90),
+        patch_size=2,
+        patch_size_t=1,
+        channels=[128, 128, 128],  # 输出通道,对应不同 Transformer 层
+        nums_rb=2,
+        use_temporal_attn=False,  # 可选:是否使用时间注意力
+    ):
         super().__init__()
         
-        # 光流预处理网络
-        self.flow_refine = nn.Sequential(
-            nn.Conv3d(flow_c, hidden, 3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.ReLU(),
-            nn.Conv3d(hidden, flow_c, 3, padding=1)
-        )
-        
-        # 特征增强网络
-        self.feature_enhance = nn.Sequential(
-            nn.Conv3d(traj_c, hidden, 3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.ReLU(),
-            nn.Conv3d(hidden, traj_c, 3, padding=1)
-        )
-        
-        # 融合网络
-        self.fusion = nn.Sequential(
-            nn.Conv3d(traj_c * 2, hidden, 3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.ReLU(),
-            nn.Conv3d(hidden, traj_c, 3, padding=1)
-        )
-    
-    def forward(self, traj_latent, flow, control_scale=1.0):
-        """
-        Args:
-            traj_latent: [B, 16, T, H, W] 静态轨迹
-            flow: [B, 2, T, H, W] 光流
-        
-        Returns:
-            output: [B, 16, T, H, W] 调制后的轨迹
-        """
-        B, C, T, H, W = traj_latent.shape
-        
-        # 1. 精炼光流
-        refined_flow = self.flow_refine(flow)
-        refined_flow = flow + refined_flow * control_scale
-        
-        # 2. 对每一帧进行 warp
-        warped_frames = []
-        for t in range(T):
-            frame = traj_latent[:, :, t, :, :]  # [B, C, H, W]
-            flow_t = refined_flow[:, :, t, :, :]  # [B, 2, H, W]
-            
-            # 使用光流进行 warp
-            warped = self.warp_with_flow(frame, flow_t)
-            warped_frames.append(warped)
-        
-        warped_traj = torch.stack(warped_frames, dim=2)  # [B, C, T, H, W]
-        
-        # 3. 特征增强
-        enhanced = self.feature_enhance(traj_latent)
-        
-        # 4. 融合原始和 warped
-        fused = torch.cat([warped_traj, enhanced], dim=1)
-        output = self.fusion(fused)
-        
-        return output
-    
-    def warp_with_flow(self, x, flow):
-        """
-        使用光流对特征进行 warp
-        
-        Args:
-            x: [B, C, H, W] 输入特征
-            flow: [B, 2, H, W] 光流 (dx, dy)
-        
-        Returns:
-            warped: [B, C, H, W] warp 后的特征
-        """
-        B, C, H, W = x.shape
-        
-        # 创建采样网格
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(H, device=x.device, dtype=x.dtype),
-            torch.arange(W, device=x.device, dtype=x.dtype),
-            indexing='ij'
-        )
-        grid = torch.stack([grid_x, grid_y], dim=0)  # [2, H, W]
-        grid = grid.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
-        
-        # 应用光流
-        grid = grid + flow
-        
-        # 归一化到 [-1, 1]
-        grid[:, 0] = 2.0 * grid[:, 0] / (W - 1) - 1.0
-        grid[:, 1] = 2.0 * grid[:, 1] / (H - 1) - 1.0
-        
-        # 转换为 grid_sample 格式 [B, H, W, 2]
-        grid = grid.permute(0, 2, 3, 1)
-        
-        # 执行 warp
-        warped = F.grid_sample(
-            x, grid,
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True
-        )
-        
-        return warped
+        self.channels = channels  # 保存为实例变量
+        self.nums_rb = nums_rb
 
-class TrajectoryConstrainedMotion(nn.Module):
-    def __init__(self, traj_c=16, flow_c=2, hidden=128):
-        super().__init__()
-        
-        # 1. 轨迹编码器（空间约束）
-        self.traj_encoder = nn.Sequential(
-            nn.Conv3d(traj_c, hidden, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-        )
-        
-        # 2. 光流编码器（运动信息）
+        # 1. 时空编码器:将光流编码为初始特征
         self.flow_encoder = nn.Sequential(
-            nn.Conv3d(flow_c, hidden, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden),
+            # 3D 卷积:同时处理时空
+            nn.Conv3d(flow_c, 64, kernel_size=(3,3,3), padding=(1,1,1)),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv3d(64, 128, kernel_size=(3,3,3), padding=(1,1,1)),
+            nn.GroupNorm(8, 128),
             nn.SiLU(),
         )
         
-        # 3. 参考系对齐模块
-        self.align_module = nn.Sequential(
-            nn.Conv3d(hidden * 2, hidden, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-            nn.Conv3d(hidden, hidden, kernel_size=3, padding=1),
-        )
+        # 2. 可选:时间注意力(增强时序建模)
+        self.use_temporal_attn = use_temporal_attn
+        if use_temporal_attn:
+            self.temporal_attn = TemporalSelfAttention(128, num_heads=4)
         
-        # 4. 空间注意力
-        self.spatial_attention = nn.Sequential(
-            nn.Conv3d(hidden, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
+        # 3. Patchify:将 3D 特征转为 2D 特征序列
+        self.patch_size = (patch_size_t, patch_size, patch_size)
+        self.patchify = Patchify3D(self.patch_size)
         
-        # 5. 生成调制参数（修复：使用 traj_c 而不是 out_c）
-        self.to_gamma = zero_module(nn.Conv3d(hidden, traj_c, 1))
-        self.to_beta = zero_module(nn.Conv3d(hidden, traj_c, 1))
-        self.norm = nn.GroupNorm(4, traj_c)  # 使用 traj_c
+        # 4. 2D ResNet blocks:提取多尺度空间特征
+        cin = 128 * patch_size_t * patch_size * patch_size
+        self.conv_in = nn.Conv2d(cin, channels[0], 3, 1, 1)
+        
+        self.body = nn.ModuleList()
+        for i in range(len(channels)):
+            for j in range(nums_rb):
+                if i != 0 and j == 0:
+                    self.body.append(
+                        ResnetBlock(channels[i-1], channels[i], down=False, ksize=3, sk=True, use_conv=False)
+                    )
+                else:
+                    self.body.append(
+                        ResnetBlock(channels[i], channels[i], down=False, ksize=3, sk=True, use_conv=False)
+                    )
+        
+        # 初始化
+        self._init_weights()
     
-    def forward(self, traj_latent, flow, control_scale):
-        """
-        traj_latent: [B, 16, T, H, W] 静态视角的轨迹
-        flow: [B, 2, T, H, W] 相机运动
-        control_scale: 控制强度
-        返回: [B, 16, T, H, W] 调制后的轨迹特征
-        """
-        # 编码
-        traj_feat = self.traj_encoder(traj_latent)
-        flow_feat = self.flow_encoder(flow)
-        
-        # 参考系对齐
-        combined = torch.cat([traj_feat, flow_feat], dim=1)
-        aligned = self.align_module(combined)
-        
-        # 空间注意力
-        attention = self.spatial_attention(aligned)
-        constrained = aligned * attention
-        
-        # 生成调制参数
-        gamma = self.to_gamma(constrained)
-        beta = self.to_beta(constrained)
-        
-        # FiLM 调制
-        out = traj_latent + control_scale * (self.norm(traj_latent) * gamma + beta)
-        
-        return out
-
-# ============================================光流===========================================
-
-    def __init__(self, flow_c=2, hidden=64):
-        super().__init__()
-        
-        # 1. 空间编码（保留位置信息）
-        self.camera_spatial = nn.Sequential(
-            nn.Conv3d(flow_c, hidden, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU()
-        )
-        
-        # 2. 时间建模
-        self.camera_temporal = nn.Sequential(
-            nn.Conv3d(hidden, hidden, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU()
-        )
-        
-        # 3. 生成调制参数（不用 zero_module，用小初始化）
-        self.to_gamma = nn.Conv3d(hidden, flow_c, 1)
-        self.to_beta = nn.Conv3d(hidden, flow_c, 1)
-        
-        # 小初始化（而不是零初始化）
-        nn.init.normal_(self.to_gamma.weight, std=0.01)
-        nn.init.zeros_(self.to_gamma.bias)
-        nn.init.normal_(self.to_beta.weight, std=0.01)
-        nn.init.zeros_(self.to_beta.bias)
-        
-        # 4. 使用 GroupNorm（而不是 InstanceNorm）
-        self.norm = nn.GroupNorm(1, flow_c)  # 1 group = LayerNorm
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv3d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
     
-    def forward(self, static_object_flow, camera_flow, control_scale=1.0):
-        # 空间+时间编码
-        cam_feat = self.camera_spatial(camera_flow)
-        cam_feat = self.camera_temporal(cam_feat)
-        
-        # 生成调制参数
-        gamma = self.to_gamma(cam_feat)
-        beta = self.to_beta(cam_feat)
-        
-        # FiLM 调制（改进版）
-        normed = self.norm(static_object_flow)
-        out = static_object_flow + control_scale * (normed * (1 + gamma) + beta)
-        #                                                    ^^^^^^^^
-        #                                                    关键：1 + gamma
-        return out
-
-    """
-    专为稀疏光流设计的调制器
-    """
-    def __init__(self, flow_c=2, hidden=64):
-        super().__init__()
-        
-        # 提取物体区域的相机光流
-        self.camera_extractor = nn.Sequential(
-            nn.Conv3d(flow_c, hidden, 3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-            nn.Conv3d(hidden, flow_c, 1)
-        )
-        
-        # 小初始化
-        nn.init.normal_(self.camera_extractor[-1].weight, std=0.01)
-        nn.init.zeros_(self.camera_extractor[-1].bias)
-    
-    def forward(self, static_object_flow, camera_flow, control_scale=1.0):
-        # 创建物体 mask
-        mask = (static_object_flow.abs().sum(dim=1, keepdim=True) > 1e-4).float()
-        
-        # 提取物体区域的相机光流
-        camera_at_object = self.camera_extractor(camera_flow) * mask
-        
-        # 简单相加
-        output = static_object_flow + control_scale * camera_at_object
-        
-        return output
-class WarpResidualFlowModulator(nn.Module):
-    """
-    将静态视角物体光流转换为动态视角物体光流。
-
-    核心思路变更（v2）：
-      - 旧方案：grid_sample 做空间 warp → 对稀疏光流几乎无效
-      - 新方案：在物体区域做自适应加法融合 + 残差修正
-
-    流程：
-      1. 物体 mask 提取
-      2. 在物体区域采样 camera_flow，与 static_flow 做自适应融合
-      3. 残差网络修正融合误差（处理透视非均匀性、bbox 边界等）
-      4. 输出 = fused_flow + residual
-
-    输入：
-      static_object_flow: [B, 2, T, H, W]  静态视角物体光流（稀疏）
-      camera_flow:        [B, 2, T, H, W]  全局相机运动光流（稠密）
-    输出：
-      dynamic_object_flow: [B, 2, T, H, W] 动态视角物体光流
-    """
-
-    def __init__(self, hidden=32, num_res_blocks=2):
-        super().__init__()
-
-        # 自适应融合权重网络
-        # 输入：static_flow(2) + camera_flow(2) + mask(1) = 5
-        # 输出：融合权重 alpha(1)，控制 camera_flow 加多少
-        self.fusion_net = nn.Sequential(
-            nn.Conv3d(5, hidden, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-            nn.Conv3d(hidden, 1, kernel_size=1),
-            nn.Sigmoid(),  # alpha in [0, 1]
-        )
-
-        # 残差修正网络
-        # 输入：fused_flow(2) + camera_flow(2) + mask(1) = 5
-        in_c = 5
-        layers = [
-            nn.Conv3d(in_c, hidden, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-        ]
-        for _ in range(num_res_blocks):
-            layers.append(ResBlock3D(hidden))
-        layers.append(nn.Conv3d(hidden, 2, kernel_size=1))
-        self.residual_net = nn.Sequential(*layers)
-
-        # 残差网络输出初始化接近零
-        nn.init.normal_(self.residual_net[-1].weight, std=0.001)
-        nn.init.zeros_(self.residual_net[-1].bias)
-
-    def forward(self, static_object_flow, camera_flow, control_scale=1.0):
+    def forward(self, flow, warmup_scale=1.0):
         """
-        static_object_flow: [B, 2, T, H, W]
-        camera_flow:        [B, 2, T, H, W]
+        flow: [B, 2, T, H, W] - 光流,T=13, H=60, W=90
+        warmup_scale: float - 控制强度(训练初期较小)
+        
+        返回: List[[BT, C, H', W']] - 多尺度特征,用于 MGF
         """
-        # 1. 物体 mask
-        mask = (static_object_flow.abs().sum(dim=1, keepdim=True) > 1e-4).float()
-
-        # 2. 自适应融合：alpha 控制 camera_flow 的混合比例
-        fusion_input = torch.cat([static_object_flow, camera_flow, mask], dim=1)
-        alpha = self.fusion_net(fusion_input)  # [B, 1, T, H, W]
-
-        # 融合：static + alpha * camera，只在物体区域
-        fused_flow = static_object_flow + alpha * camera_flow * mask
-
-        # 3. 残差修正
-        residual_input = torch.cat([fused_flow, camera_flow, mask], dim=1)
-        residual = self.residual_net(residual_input)
-        residual = residual * mask  # 背景保持零
-
-        # 4. 输出
-        output = fused_flow + control_scale * residual
-
-        return output
-
-
-class ResBlock3D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.spatial = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-        )
-        self.temporal = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-        )
-
-    def forward(self, x):
-        h = self.spatial(x)
-        h = self.temporal(h)
-        return x + h
-
+        B, _, T, H, W = flow.shape
+        
+        # 1. 时空编码
+        x = self.flow_encoder(flow)  # [B, 128, T, H, W]
+        
+        # 2. 可选:时间注意力
+        if self.use_temporal_attn:
+            x = self.temporal_attn(x)
+        
+        # 3. 应用 warmup_scale(渐进式注入)
+        x = x * warmup_scale
+        
+        # 4. Patchify:3D → 2D
+        x = self.patchify(x)  # [B, C', T', H', W']
+        x = rearrange(x, "B C T H W -> (B T) C H W")
+        
+        # 5. 2D ResNet:提取多尺度特征
+        features = []
+        x = self.conv_in(x)
+        
+        for i in range(len(self.channels)):  # 假设 nums_rb=2
+            for j in range(self.nums_rb ):
+                idx = i * self.nums_rb  + j
+                x = self.body[idx](x)
+            features.append(x)  # 每个尺度保存一次
+        
+        return features
 
 class TrajExtractor(nn.Module):
     def __init__(
@@ -654,11 +322,6 @@ class TrajExtractor(nn.Module):
         use_conv=True,
     ):
         super(TrajExtractor, self).__init__()
-        self.flow_modulator = ImprovedFlowWarpModulator(
-            traj_c=cin,
-            flow_c=2,
-            hidden=128
-        )
         self.vae_downsize = vae_downsize
         # self.vae_spatial_emulator = VAESpatialEmulator(kernel_size=vae_downsize[-2:])
         self.patch_size = (patch_size_t, patch_size, patch_size)
@@ -701,16 +364,11 @@ class TrajExtractor(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(conv_init)
-        # zero_module(self.flow_modulator.to_gamma)
-        # zero_module(self.flow_modulator.to_beta)
 
-    def forward(self, traj_latent, flow, warmup_scale = 1.0):
+    def forward(self, flow, warmup_scale = 1.0):
         """
         x: torch.Tensor: shape [B C T H W]
         """
-        # 移除 detach：让 FiLM 参数能通过 predicted_flow 的梯度学习
-        # AuxHead 已冻结，不会被更新
-        x = self.flow_modulator(traj_latent, flow, warmup_scale)
         B, C, T, H, W = x.shape
         if W % self.patch_size[2] != 0:
             x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
@@ -732,7 +390,6 @@ class TrajExtractor(nn.Module):
             for j in range(self.nums_rb):
                 idx = i * self.nums_rb + j
                 x = self.body[idx](x)
-                # print(torch.sum(x))
             features.append(x)
 
         return features

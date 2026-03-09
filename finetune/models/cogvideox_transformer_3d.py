@@ -28,7 +28,7 @@ from diffusers.models.embeddings import CogVideoXPatchEmbed, TimestepEmbedding, 
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
-from ..modules import TrajExtractor,MGF,AuxHead
+from ..modules import MyTrajExtractor,MGF
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -120,7 +120,7 @@ class CogVideoXBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        video_flow_feature: Optional[torch.Tensor] = None,
+        flow_feature: Optional[torch.Tensor] = None,
         fuser=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_seq_length = encoder_hidden_states.size(1)
@@ -131,11 +131,11 @@ class CogVideoXBlock(nn.Module):
             hidden_states, encoder_hidden_states, temb
         )
         # TODO 运动特征注入中间特征
-        if video_flow_feature is not None:
-            H, W = video_flow_feature.shape[-2:]
+        if flow_feature is not None:
+            H, W = flow_feature.shape[-2:]
             T = norm_hidden_states.shape[1] // H // W
             h = rearrange(norm_hidden_states, "B (T H W) C -> (B T) C H W", H=H, W=W)
-            h = fuser(h, video_flow_feature, T=T)
+            h = fuser(h, flow_feature, T=T)
             norm_hidden_states = rearrange(h, "(B T) C H W ->  B (T H W) C", T=T)
 
         # attention
@@ -274,20 +274,19 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.motion_start, self.motion_end = motion_block_range
             assert 0 <= self.motion_start < self.motion_end <= num_layers
 
-            self.traj_extractor = TrajExtractor(
-                vae_downsize=(4, 8, 8),
+            self.traj_extractor = MyTrajExtractor(
+                flow_c=2,  # 光流通道数
+                num_frames=13,  # 帧数
+                spatial_size=(60, 90),  # 空间尺寸
                 patch_size=2,
                 patch_size_t=patch_size_t if patch_size_t is not None else 1,
+                channels=[128] * (self.motion_end - self.motion_start),
                 nums_rb=2,
-                cin=16,
-                channels=[128] * (self.motion_end - self.motion_start - 1),
-                sk=True,
-                use_conv=False,
+                use_temporal_attn=False, # 是否使用时间注意力
             )
             # self.motion_proj = nn.Conv2d(1280, 128, kernel_size=1)
             # Tora motion-guidance fuser
-            self.fuser = nn.ModuleList([MGF(128, inner_dim) for _ in range((self.motion_end - self.motion_start - 1))])
-            self.aux_head = AuxHead()
+            self.fuser = nn.ModuleList([MGF(128, inner_dim) for _ in range((self.motion_end - self.motion_start))])
         # 1. Patch embedding
         self.patch_embed = CogVideoXPatchEmbed(
             patch_size=patch_size,
@@ -457,8 +456,8 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         timestep: Union[int, float, torch.LongTensor],
-        traj_static: Optional[torch.Tensor] = None,  # [B, 1, H, W]
-        video_flow: Optional[torch.Tensor] = None,
+        static_flow: Optional[torch.Tensor] = None,
+        camera_flow: Optional[torch.Tensor] = None,
         warmup_scale: float = 1.0,
         timestep_cond: Optional[torch.Tensor] = None,
         ofs: Optional[Union[int, float, torch.LongTensor]] = None,
@@ -507,31 +506,18 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
 
-        # 3. Transformer blocks
-        video_flow_features = None
+        # TODO 获取运动特征
+        # combined_flow = torch.cat([static_flow, camera_flow], dim=1)
+        flow_features = self.traj_extractor(camera_flow, warmup_scale)
+        print("warmup_scale", warmup_scale)
         for i, block in enumerate(self.transformer_blocks):
-            # TODO 获取运动特征
-            if traj_static is not None and self.motion_start == i:
-                # 使用第 motion_start 层的特征计算latent -> 估计光流 -> 调制静态轨迹
-                # traj_static = traj_static.permute(0, 2, 1, 3, 4)
-                output = self.norm_final(hidden_states)
-                output = self.norm_out(output, temb=emb)
-                output = self.proj_out(output)
-                p = self.config.patch_size
-                output = output.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
-                output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)# 1 13 16 60 90
-                predicted_flow = self.aux_head(output).permute(0, 2, 1, 3, 4).contiguous()# 1 2 13 60 90
-                predicted_loss = torch.norm(predicted_flow - video_flow, dim=1).mean()
-                print("predicted_loss ", predicted_loss)
-                video_flow_features = self.traj_extractor(traj_static, predicted_flow, warmup_scale)
-                print("warmup_scale", warmup_scale)
-
-            if (video_flow_features is not None and self.motion_start < i < self.motion_end):
-                motion_idx = i - self.motion_start - 1
-                video_flow_feature = video_flow_features[motion_idx]
+            # 3. Transformer blocks
+            if (flow_features is not None and self.motion_start <= i < self.motion_end):
+                motion_idx = i - self.motion_start
+                flow_feature = flow_features[motion_idx]
                 fuser = self.fuser[motion_idx]
             else:
-                video_flow_feature = None
+                flow_feature = None
                 fuser = None
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 def create_custom_forward(module):
@@ -546,7 +532,7 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     emb,
                     image_rotary_emb,
                     attention_kwargs,
-                    video_flow_feature,
+                    flow_feature,
                     fuser,
                 )
             else:
@@ -556,7 +542,7 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb=emb,
                     image_rotary_emb=image_rotary_emb,
                     attention_kwargs=attention_kwargs,
-                    video_flow_feature=video_flow_feature,
+                    flow_feature=flow_feature,
                     fuser=fuser
                 )
 
